@@ -2,16 +2,22 @@ import glob
 import os
 import subprocess
 import shutil
+import sys
 
 from PIL import Image
 import numpy as np
 import cv2
+from keras.preprocessing import image
+from keras.models import Model
 
-from simpleocr.files import open_image
-from simpleocr.segmentation import ContourSegmenter, RawContourSegmenter
-from simpleocr.feature_extraction import SimpleFeatureExtractor
-from simpleocr.classification import KNNClassifier
-from simpleocr.ocr import OCR, accuracy, show_differences
+sys.path.append("src")
+
+from vgg19 import VGG19
+from imagenet_utils import preprocess_input
+from plot_utils import plot_query_answer
+from sort_utils import find_topk_unique
+from kNN import kNN
+from tSNE import plot_tsne
 
 
 IMAGES_PATH = "/opt/projects/lettering/plantillas_lettering/"
@@ -93,13 +99,6 @@ def extract_contours2(src):
      
         # finally, get the min enclosing circle
         (x, y), radius = cv2.minEnclosingCircle(c)
-        # convert all values to int
-        # center = (int(x), int(y))
-        # radius = int(radius)
-        # img = cv2.circle(img, center, radius, (255, 0, 0), 2)
-
-    # print(len(contours))
-    # cv2.drawContours(img, contours, -1, (255, 255, 0), 1)
      
     cv2.imshow("contours", img)
     cv2.imwrite(src, img)
@@ -130,6 +129,94 @@ def extract_contours(src):
         cv2.imwrite(_dst, roi)
         remove_background(_dst, _dst)
 
+
+def classifier(path):
+    # ================================================
+    # Load pre-trained model and remove higher level layers
+    # ================================================
+    print("Loading VGG19 pre-trained model...")
+    base_model = VGG19(weights='imagenet')
+    model = Model(input=base_model.input,
+                  output=base_model.get_layer('block4_pool').output)
+
+    # ================================================
+    # Read images and convert them to feature vectors
+    # ================================================
+    imgs, filename_heads, X = [], [], []
+    path = "db"
+    print("Reading images from '{}' directory...\n".format(path))
+    _files = [os.path.join(dp, f) for dp, dn, filenames in os.walk(path) for f in filenames if os.path.splitext(f)[1] == '.png']
+    print _files
+    for f in _files:
+
+        # Process filename
+        filename = os.path.splitext(f)  # filename in directory
+        filename_full = os.path.join(path,f)  # full path filename
+        head, ext = filename[0], filename[1]
+        if ext.lower() not in [".jpg", ".jpeg"]:
+            continue
+
+        # Read image file
+        img = image.load_img(filename_full, target_size=(224, 224))  # load
+        imgs.append(np.array(img))  # image
+        filename_heads.append(head)  # filename head
+
+        # Pre-process for model input
+        img = image.img_to_array(img)  # convert to array
+        img = np.expand_dims(img, axis=0)
+        img = preprocess_input(img)
+        features = model.predict(img).flatten()  # features
+        X.append(features)  # append feature extractor
+
+    X = np.array(X)  # feature vectors
+    imgs = np.array(imgs)  # images
+    print("imgs.shape = {}".format(imgs.shape))
+    print("X_features.shape = {}\n".format(X.shape))
+
+    # ===========================
+    # Find k-nearest images to each image
+    # ===========================
+    n_neighbours = 5 + 1  # +1 as itself is most similar
+    knn = kNN()  # kNN model
+    knn.compile(n_neighbors=n_neighbours, algorithm="brute", metric="cosine")
+    knn.fit(X)
+
+    # ==================================================
+    # Plot recommendations for each image in database
+    # ==================================================
+    output_rec_dir = os.path.join("output", "rec")
+    if not os.path.exists(output_rec_dir):
+        os.makedirs(output_rec_dir)
+    n_imgs = len(imgs)
+    ypixels, xpixels = imgs[0].shape[0], imgs[0].shape[1]
+    for ind_query in range(n_imgs):
+
+        # Find top-k closest image feature vectors to each vector
+        print("[{}/{}] Plotting similar image recommendations for: {}".format(ind_query+1, n_imgs, filename_heads[ind_query]))
+        distances, indices = knn.predict(np.array([X[ind_query]]))
+        distances = distances.flatten()
+        indices = indices.flatten()
+        indices, distances = find_topk_unique(indices, distances, n_neighbours)
+
+        # Plot recommendations
+        rec_filename = os.path.join(output_rec_dir, "{}_rec.png".format(filename_heads[ind_query]))
+        x_query_plot = imgs[ind_query].reshape((-1, ypixels, xpixels, 3))
+        x_answer_plot = imgs[indices].reshape((-1, ypixels, xpixels, 3))
+        plot_query_answer(x_query=x_query_plot,
+                          x_answer=x_answer_plot[1:],  # remove itself
+                          filename=rec_filename)
+
+    # ===========================
+    # Plot tSNE
+    # ===========================
+    output_tsne_dir = os.path.join("output")
+    if not os.path.exists(output_tsne_dir):
+        os.makedirs(output_tsne_dir)
+    tsne_filename = os.path.join(output_tsne_dir, "tsne.png")
+    print("Plotting tSNE to {}...".format(tsne_filename))
+    plot_tsne(imgs, X, tsne_filename)
+
+
 def main():
     for _file in glob.glob("{}/*_processed.png".format(IMAGES_PATH)):
         os.remove(_file)
@@ -141,9 +228,12 @@ def main():
         dst_image = os.path.join(dirname, "{}_processed.png".format(name))
 
         # Imagemagick process
-        remove_transparency_and_saturate(image, dst_image)
+        # remove_transparency_and_saturate(image, dst_image) ## !!!!
 
-        extract_contours(dst_image)
+        # extract_contours(dst_image)
+
+        # classifier(DST_PATH)  ## !!!!
+        
         # detect_boundaries(dst_image)
         
         # segmenter = ContourSegmenter(blur_y=5, blur_x=5, block_size=11, c=10)
